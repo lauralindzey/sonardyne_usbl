@@ -198,7 +198,8 @@ class SonardyneModemNode(object):
         hex_data = data.hex().upper()
 
         # The Modem class's sendSMS isn't flexible enough, so roll our own.
-        sms_cmd = "SMS:{:04d};TS{},P0,C0,A3,R0,B0|{}\n".format(request.packet.dest, rate, hex_data)
+        # Roland filters on messages and requires a <
+        sms_cmd = "<SMS:{:04d};TS{},P0,C0,A3,R0,B0|{}\n".format(request.packet.dest, rate, hex_data)
         rospy.logerr("Sending command!: {}".format(sms_cmd))
         self.modem.send(sms_cmd)
 
