@@ -116,6 +116,10 @@ class SonardyneModemNode(object):
             return None, None
         addr = int(mm['addr'])  # Should succeed, since regex matched to 4 digits
         data = mm['data']
+        # If data is odd-length, then the hex ascii conversion will fail.
+        # Go ahead and try to parse the bytes that did come in successfully.
+        if len(data) % 2 == 1:
+            data = data[:-1]
         try:
             # Given that the regex matches hex characters, this will only fail
             # if it's an odd-length string.
