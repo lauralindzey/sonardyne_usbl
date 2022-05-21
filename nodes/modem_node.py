@@ -26,6 +26,11 @@ class SonardyneModemNode(object):
             msg = "{} is not a valid sonardyine Telemetry Scheme"
             raise Exception(msg)
 
+        # In some network configurations, the packets coming from the
+        # Sonardyne are split, such that a single message is split across
+        # several socket.recv() calls. So, try to piece them back together.
+        self.accumulated_packet = None
+
         try:
             self.sdyne_addr = rospy.get_param("~sdyne_addr")
         except KeyError:
@@ -79,8 +84,7 @@ class SonardyneModemNode(object):
         if data is not None:
             # The getResponse parsing is a bit complicated; the ros_acomms side of
             # things just needs raw byes, so we just do our own parsing.
-            if "SMS" in data['raw']:
-                self.publishReceivedPacket(data['raw'])
+            self.handleReceivedPacket(data['raw'])
 
             self.raw_pub.publish(String(data['raw']))
             if 'response_type' in data and data['response_type'] == 'SMS' and 'message' in data:
@@ -109,6 +113,14 @@ class SonardyneModemNode(object):
     def parseSMS(self, msg: str) -> Tuple[Optional[int], Optional[bytes]]:
         # NOTE(lindzey): I think you can compile the regex ahead of time for
         #   some sort of performance improvement? (Not like this is high-rate...)
+
+        # Hacky way of detecting whether the message is new-line terminated.
+        # If it's not, then we probably have a case where it got split into two
+        # reads from the socket.
+        if msg == msg.strip():
+            rospy.logerr("We probably have an incomplete message!")
+
+
         regex = r"^(?P<prelim>.*)SMS:(?P<addr>[0-9]{4})(?P<params>.*)\|(?P<data>[0-9A-F]*)"
         mm = re.match(regex, msg)
         if mm is None:
@@ -129,9 +141,64 @@ class SonardyneModemNode(object):
                          .format(len(data), data))
             return addr, None
         print("Received {} bytes from {}".format(len(data_bytes), addr))
+
+
+        packet = ReceivedPacket()
+        packet.header.stamp = rospy.Time.now()
+        packet.packet.src = addr
+        packet.packet.dest = self.sdyne_addr  # TODO(lindzey): Add this to class?
+        packet.packet.packet_type = Packet.PACKET_TYPE_UNKNOWN
+        # Not sure how else to say "n/a"
+        packet.packet.miniframe_rate = -1
+        # The Sonardyne actually changes rates, but the received message
+        # doesn't indicate what rate it was received on.
+        packet.packet.dataframe_rate = -1
+        # We don't have miniframes / dataframes, and ros_acomms assumes that
+        # there will be data in the miniframes, so only using those.
+        packet.packet.miniframe_bytes = data_bytes
+        packet.packet.dataframe_bytes = []
+        packet.minibytes_valid = [0, len(data_bytes)]
+        packet.databytes_valid = []
+        # The CST is micromodem specific, so don't fill that out.
+        self.packet_rx_pub.publish(packet)
+
         return addr, data_bytes
 
-    def publishReceivedPacket(self, raw_data: str) -> None:
+    def isHexAscii(self, msg: str) -> bool:
+        """
+        Test whether input message contains only hex ascii characters.
+        TODO(lindzey): When I have internet again, replace with actual library function
+        """
+        hex_chars = ['0','1','2','3','4','5','6','7','8','9',
+                     'A', 'B', 'C', 'D', 'E', 'F']
+        return all([ch in hex_chars for ch in msg])
+
+    def handleReceivedPacket(self, raw_data: str) -> None:
+        # Try to handle the case where a new packet is a continuation of
+        # the previous one.
+        if self.accumulated_packet is not None:
+            rospy.loginfo("Last packet wasn't complete")
+            if self.isHexAscii(raw_data.strip()):
+                rospy.loginfo("...and can append new data to it!")
+                self.accumulated_packet = self.accumulated_packet + raw_data
+                # Was the new data terminated?
+                if self.accumulated_packet != self.accumulated_packet.strip():
+                    rospy.loginfo("Tryign to parse SMS")
+                    self.parseSMS(self.accumulated_packet)
+                    self.accumulated_packet = None
+                # TODO(lindzey): This logic is ugly.
+                return
+
+            else:
+                # Should try to send it anyways ... maybe the first bytes will be useful
+                self.parseSMS(self.accumulated_packet)
+                self.accumulated_packet = None
+
+        # We don't care about non-SMS messages.
+        if "SMS" not in raw_data:
+            return
+
+
         # NOTE(lindzey): This might be where we add a state machine checking
         #    whether a given message was sent successfully.
         if 'FAILED' in raw_data:
@@ -148,30 +215,16 @@ class SonardyneModemNode(object):
             rospy.loginfo("Transmission confirmed: {}".format(raw_data))
             return
 
-        print("data is {}".format(raw_data))
-        src_addr, data_bytes = self.parseSMS(raw_data)
-        if data_bytes is None:
-            rospy.logwarn("Could not parse SMS: {}".format(raw_data))
-            return
+        if raw_data == raw_data.strip():
+            # This is probably an incomplete packet!
+            print("This is probably an incomplete packet -- not parsing yet")
+            self.accumulated_packet = raw_data
+        else:
+            src_addr, data_bytes = self.parseSMS(raw_data)
+            if data_bytes is None:
+                rospy.logwarn("Could not parse SMS: {}".format(raw_data))
+                return
 
-        packet = ReceivedPacket()
-        packet.header.stamp = rospy.Time.now()
-        packet.packet.src = src_addr
-        packet.packet.dest = self.sdyne_addr  # TODO(lindzey): Add this to class?
-        packet.packet.packet_type = Packet.PACKET_TYPE_UNKNOWN
-        # Not sure how else to say "n/a"
-        packet.packet.miniframe_rate = -1
-        # The Sonardyne actually changes rates, but the received message
-        # doesn't indicate what rate it was received on.
-        packet.packet.dataframe_rate = -1
-        # We don't have miniframes / dataframes, and ros_acomms assumes that
-        # there will be data in the miniframes, so only using those.
-        packet.packet.miniframe_bytes = data_bytes
-        packet.packet.dataframe_bytes = []
-        packet.minibytes_valid = [0, len(data_bytes)]
-        packet.databytes_valid = []
-        # The CST is micromodem specific, so don't fill that out.
-        self.packet_rx_pub.publish(packet)
 
     def handleQueueTxPacket(self, request: QueueTxPacketRequest) -> None:
         # NOTE(lindzey): This driver does not implement any sort of queue,
