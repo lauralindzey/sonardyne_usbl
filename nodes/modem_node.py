@@ -122,7 +122,7 @@ class SonardyneModemNode(object):
             data_bytes = bytes.fromhex(data)
         except ValueError:
             rospy.logerr("Could not convert {} chars to hex: {!r}"
-                         .format(len(data_bytes), data_bytes))
+                         .format(len(data), data))
             return addr, None
         print("Received {} bytes from {}".format(len(data_bytes), addr))
         return addr, data_bytes
